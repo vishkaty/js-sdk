@@ -12,6 +12,10 @@ const {
   TotalResponseSchema,
   MediaSchema,
   ProductOptionSchema,
+  CheckoutCreateRequestContextSchema,
+  CartResponseSchema,
+  OrderLineItemSchema,
+  CheckoutResponseMessageSchema,
 } = require("./.dist/spec_generated.js");
 
 const accepts = (schema, value) => schema.safeParse(value).success === true;
@@ -94,4 +98,77 @@ test("ProductOptionSchema accepts a non-empty values array", () => {
   assert.ok(
     accepts(ProductOptionSchema, { name: "size", values: [{ label: "S" }] })
   );
+});
+
+// ---------------------------------------------------------------------------
+// Refine-layer constraints: uniqueItems, contains/minContains/maxContains, and
+// object-scoped `const` (js-sdk#33 deferred these). Each field schema is
+// isolated via `.shape.<field>` so the assertion targets one constraint.
+// ---------------------------------------------------------------------------
+
+const totalEntry = (type, amount = 100) => ({ amount, type });
+
+// --- uniqueItems: Context.eligibility is { type: array, uniqueItems: true } --
+
+test("Context.eligibility rejects duplicate items (uniqueItems)", () => {
+  const schema = CheckoutCreateRequestContextSchema.shape.eligibility;
+  assert.ok(rejects(schema, ["com.example.gold", "com.example.gold"]));
+});
+
+test("Context.eligibility accepts unique items (and an empty array)", () => {
+  const schema = CheckoutCreateRequestContextSchema.shape.eligibility;
+  assert.ok(accepts(schema, ["com.example.gold", "org.school.student"]));
+  assert.ok(accepts(schema, []));
+});
+
+// --- minContains/maxContains: response totals MUST contain exactly one --------
+// `subtotal` and exactly one `total` entry (Totals schema, both bounds = 1).
+
+test("CartResponse.totals rejects totals missing the subtotal entry", () => {
+  const schema = CartResponseSchema.shape.totals;
+  assert.ok(rejects(schema, [totalEntry("total")]));
+});
+
+test("CartResponse.totals rejects two subtotals (maxContains: 1)", () => {
+  const schema = CartResponseSchema.shape.totals;
+  assert.ok(
+    rejects(schema, [
+      totalEntry("subtotal"),
+      totalEntry("subtotal"),
+      totalEntry("total"),
+    ])
+  );
+});
+
+test("CartResponse.totals accepts exactly one subtotal and one total", () => {
+  const schema = CartResponseSchema.shape.totals;
+  assert.ok(
+    accepts(schema, [
+      totalEntry("subtotal"),
+      totalEntry("tax"),
+      totalEntry("total"),
+    ])
+  );
+});
+
+// --- object-scoping: an itemized `totals` field (LineItem/Order line) carries
+// NO contains rule and must accept a breakdown without subtotal/total. Same
+// field name as above, different containing object -> must not be constrained.
+
+test("OrderLineItem.totals accepts an itemized breakdown with no subtotal/total", () => {
+  const schema = OrderLineItemSchema.shape.totals;
+  assert.ok(accepts(schema, [totalEntry("tax"), totalEntry("fee")]));
+  assert.ok(accepts(schema, []));
+});
+
+// --- object-scoped `const`: message_error/info/warning each pin `type` to a
+// different const. They collapse into one Message schema, so `type` is
+// genuinely ambiguous and MUST NOT be locked to any single const value.
+
+test("CheckoutResponseMessage.type is not locked to a single const value", () => {
+  const schema = CheckoutResponseMessageSchema.shape.type;
+  assert.ok(accepts(schema, "error"));
+  assert.ok(accepts(schema, "info"));
+  assert.ok(accepts(schema, "warning"));
+  assert.ok(rejects(schema, "not-a-message-type"));
 });

@@ -10,6 +10,17 @@
  * same constraints (datamodel-code-generator emits most natively); this script
  * is the JS-side analogue of python-sdk's `postprocess_models.py`.
  *
+ * Coverage. Numeric/string/array-length/pattern constraints are expressed with
+ * native zod chain methods (`.int()`, `.gte()`, `.min()`, `.regex()`, ...).
+ * Constraints with no native chain method are expressed with `.refine`:
+ *   - `const`         -> `.refine((v) => v === <literal>)`
+ *   - `uniqueItems`   -> `.refine` on structural-equality set size
+ *   - `contains` + `minContains`/`maxContains` -> `.refine` counting the
+ *      elements that match a fixed-value predicate derived from
+ *      `contains.properties.<field>.const` (mirrors the python-sdk).
+ * A predicate that is not expressible as a fixed-value equality is left
+ * untouched rather than guessed.
+ *
  * Approach (object-scoped, zero-false-positive by construction):
  *   1. Scan the UCP JSON Schemas, resolving `$ref`/`allOf`, and index every
  *      object schema by the sorted set of its property names. For each such
@@ -84,6 +95,7 @@ function resolveRef(ref, baseFile) {
 // Constraint keywords we can express in zod today.
 const CONSTRAINT_KEYS = [
   "type",
+  "const",
   "minimum",
   "maximum",
   "exclusiveMinimum",
@@ -93,6 +105,7 @@ const CONSTRAINT_KEYS = [
   "pattern",
   "minItems",
   "maxItems",
+  "uniqueItems",
 ];
 
 /** Effective value constraints for a schema node, following $ref + allOf. */
@@ -169,6 +182,72 @@ function resolveObject(node, file, seen = new Set(), depth = 0) {
   return Object.keys(properties).length ? { properties, file } : null;
 }
 
+/**
+ * Derive a single `contains` occurrence rule from a schema node that carries a
+ * `contains` predicate. We only enforce a rule whose predicate is expressible
+ * as a fixed-value equality: `contains.properties.<field>.const`. Anything
+ * richer (enum/pattern/nested predicates) is left untouched -- the whole point
+ * is zero false positives, so an inexpressible predicate is skipped, not guessed.
+ * Mirrors python-sdk's contains handling.
+ */
+function deriveContainsRule(node) {
+  const predicate = node.contains;
+  if (!predicate || typeof predicate !== "object") {
+    return null;
+  }
+  const properties =
+    predicate.properties && typeof predicate.properties === "object"
+      ? predicate.properties
+      : {};
+  const equals = [];
+  for (const [field, sub] of Object.entries(properties)) {
+    if (sub && typeof sub === "object" && "const" in sub) {
+      equals.push([field, sub.const]);
+    }
+  }
+  if (!equals.length) {
+    return null; // predicate not expressible as fixed-value equality
+  }
+  // JSON Schema: bare `contains` means "at least one match" (minContains
+  // defaults to 1). `?? 1` preserves an explicit minContains: 0.
+  const min = typeof node.minContains === "number" ? node.minContains : 1;
+  const max = typeof node.maxContains === "number" ? node.maxContains : null;
+  return { equals, min, max };
+}
+
+/**
+ * All `contains`/minContains/maxContains occurrence rules for an array schema,
+ * following $ref and merging allOf branches (each branch may carry its own
+ * `contains`, as UCP's Totals does for `subtotal` and `total`).
+ */
+function arrayContainsRules(node, file, seen = new Set(), depth = 0) {
+  if (!node || typeof node !== "object" || depth > 32) {
+    return [];
+  }
+  if (typeof node.$ref === "string") {
+    const key = `${file}|${node.$ref}`;
+    if (seen.has(key)) {
+      return [];
+    }
+    seen.add(key);
+    const resolved = resolveRef(node.$ref, file);
+    return arrayContainsRules(resolved.node, resolved.file, seen, depth + 1);
+  }
+  const rules = [];
+  if (node.contains) {
+    const rule = deriveContainsRule(node);
+    if (rule) {
+      rules.push(rule);
+    }
+  }
+  if (Array.isArray(node.allOf)) {
+    for (const sub of node.allOf) {
+      rules.push(...arrayContainsRules(sub, file, new Set(seen), depth + 1));
+    }
+  }
+  return rules;
+}
+
 /** Normalize a node's constraints into a canonical descriptor + signature. */
 function describeConstraint(propertyNode, file) {
   const eff = effectiveConstraints(propertyNode, file);
@@ -177,6 +256,7 @@ function describeConstraint(propertyNode, file) {
     : eff.type;
   const descriptor = {};
   if (type === "integer") descriptor.int = true;
+  if (eff.const !== undefined) descriptor.const = eff.const;
   if (eff.minimum !== undefined) descriptor.minimum = eff.minimum;
   if (eff.maximum !== undefined) descriptor.maximum = eff.maximum;
   if (eff.exclusiveMinimum !== undefined)
@@ -188,6 +268,9 @@ function describeConstraint(propertyNode, file) {
   if (eff.pattern !== undefined) descriptor.pattern = eff.pattern;
   if (eff.minItems !== undefined) descriptor.minItems = eff.minItems;
   if (eff.maxItems !== undefined) descriptor.maxItems = eff.maxItems;
+  if (eff.uniqueItems === true) descriptor.uniqueItems = true;
+  const containsRules = arrayContainsRules(propertyNode, file);
+  if (containsRules.length) descriptor.containsRules = containsRules;
   const signature = JSON.stringify(descriptor);
   return Object.keys(descriptor).length ? { descriptor, signature } : null;
 }
@@ -317,6 +400,53 @@ function toRegexLiteral(pattern) {
   return `/${out}/`;
 }
 
+/** `.refine` enforcing a JSON Schema `const` as a value equality. */
+function constRefine(value) {
+  const literal = JSON.stringify(value);
+  return `.refine((v) => v === ${literal}, { message: ${JSON.stringify(
+    `must equal ${literal}`
+  )} })`;
+}
+
+/** `.refine` enforcing `uniqueItems: true` (structural equality of elements). */
+function uniqueItemsRefine() {
+  return (
+    ".refine((arr) => new Set(arr.map((item) => JSON.stringify(item))).size" +
+    ' === arr.length, { message: "array items must be unique" })'
+  );
+}
+
+/**
+ * `.refine` enforcing one `contains`/minContains/maxContains occurrence rule.
+ * The predicate is a fixed-value equality derived from the schema; the count of
+ * matching elements must fall within [min, max].
+ */
+function containsRefine(rule) {
+  const condition = rule.equals
+    .map(
+      ([field, value]) =>
+        `e[${JSON.stringify(field)}] === ${JSON.stringify(value)}`
+    )
+    .join(" && ");
+  const bounds = [];
+  if (rule.min != null) bounds.push(`count >= ${rule.min}`);
+  if (rule.max != null) bounds.push(`count <= ${rule.max}`);
+  const boundExpr = bounds.length ? bounds.join(" && ") : "true";
+  const label = rule.equals
+    .map(([field, value]) => `${field} === ${JSON.stringify(value)}`)
+    .join(" && ");
+  let phrase;
+  if (rule.max == null) phrase = `at least ${rule.min}`;
+  else if (rule.min === rule.max) phrase = `exactly ${rule.min}`;
+  else phrase = `between ${rule.min} and ${rule.max}`;
+  const message = `must contain ${phrase} item(s) where ${label}`;
+  return (
+    `.refine((arr) => { const count = arr.filter((e) => e != null && ` +
+    `${condition}).length; return ${boundExpr}; }, ` +
+    `{ message: ${JSON.stringify(message)} })`
+  );
+}
+
 /**
  * Zod methods for a descriptor given the generated field's base kind.
  * Returns null when the base kind is incompatible with the constraint
@@ -324,6 +454,20 @@ function toRegexLiteral(pattern) {
  */
 function methodsFor(descriptor, baseKind) {
   const methods = [];
+
+  // `const` fixes the value outright; it supersedes any other value range.
+  // Injected as a `.refine` equality (rather than replacing the base call with
+  // `z.literal`) so the edit stays purely additive and base-type independent.
+  // Only applied on a scalar base whose runtime type matches the const value.
+  if (descriptor.const !== undefined) {
+    const value = descriptor.const;
+    const scalarOk =
+      (baseKind === "string" && typeof value === "string") ||
+      (baseKind === "number" && typeof value === "number");
+    if (!scalarOk) return null;
+    return [constRefine(value)];
+  }
+
   const isNumeric =
     descriptor.int !== undefined ||
     descriptor.minimum !== undefined ||
@@ -335,7 +479,11 @@ function methodsFor(descriptor, baseKind) {
     descriptor.maxLength !== undefined ||
     descriptor.pattern !== undefined;
   const isArray =
-    descriptor.minItems !== undefined || descriptor.maxItems !== undefined;
+    descriptor.minItems !== undefined ||
+    descriptor.maxItems !== undefined ||
+    descriptor.uniqueItems === true ||
+    (descriptor.containsRules !== undefined &&
+      descriptor.containsRules.length > 0);
 
   if (isNumeric) {
     if (baseKind !== "number") return null;
@@ -369,6 +517,10 @@ function methodsFor(descriptor, baseKind) {
       methods.push(`.min(${descriptor.minItems})`);
     if (descriptor.maxItems !== undefined)
       methods.push(`.max(${descriptor.maxItems})`);
+    if (descriptor.uniqueItems === true) methods.push(uniqueItemsRefine());
+    for (const rule of descriptor.containsRules ?? []) {
+      methods.push(containsRefine(rule));
+    }
   }
   return methods.length ? methods : null;
 }
@@ -434,6 +586,9 @@ function alreadyConstrained(baseCall) {
       "max",
       "length",
       "regex",
+      // `.refine` is only ever emitted by this script (const / uniqueItems /
+      // contains). Treating it as "already constrained" keeps re-runs idempotent.
+      "refine",
     ]);
     if (CONSTRAINT_METHODS.has(method)) {
       return true;
