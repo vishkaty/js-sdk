@@ -1095,10 +1095,23 @@ function writeCompatibilityCoreSchemas() {
   // alone requires payment_handlers -- see buildResponseEnvelopeSchema's
   // extraRequired parameter above); every other response_*_schema key maps
   // to the generic envelope, whatever its name.
+  // "success"/"error" (ucp.json#/$defs/success, #/$defs/error) are the SAME
+  // shape as every response_*_schema key -- allOf: [{$ref:"#/$defs/base"},
+  // {a status override}] -- and 2026-08-25's common/types/error_response.json
+  // $refs "error" directly (2 directory levels up: "../../ucp.json#/$defs/
+  // error"). Only ONCE that file is actually reachable (this pass's generic
+  // common/types projection -- see discoverCommonTypeFiles -- is what first
+  // makes it so) does the gap surface. Included by NAME, not by the same
+  // allOf-shape test as response_*_schema: ucp.json#/$defs/platform_schema
+  // and #/$defs/business_schema share the identical allOf[0] $ref shape but
+  // are a DIFFERENT, fuller, request-side form (required: services,
+  // payment_handlers, with their own service/capability sub-refs) -- mapping
+  // them to the same generic response envelope would be semantically wrong,
+  // not merely incomplete, so shape alone is not a safe generalization here.
   const realUcpSchema = loadRootSchema("ucp.json");
   const defs = {};
   for (const key of Object.keys(realUcpSchema?.$defs ?? {})) {
-    if (!/^response_.*_schema$/.test(key)) {
+    if (!/^response_.*_schema$/.test(key) && key !== "success" && key !== "error") {
       continue;
     }
     defs[key] = {
@@ -1452,11 +1465,15 @@ function writeProjectedCommonTypeSchemas(schemaCache) {
 //   - a $defs key ending in ".checkout"/".order"/".cart" marks an extension
 //     capability that attaches fields to a host resource -- the exact shape
 //     buyer_consent/discount/fulfillment/ap2_mandate already use.
-// A capability matching none of these (e.g. identity_linking, whose $defs is
-// its own config shape, not an attachment or a lookup pair) is left alone:
-// it is a pre-existing, documented gap in BOTH pins (see the PR body), not a
-// 2026-08-25 regression, and modeling it would also change the 2026-04-08
-// output -- out of scope for a root-cause-the-generator fix.
+//   - a $defs key equal to the capability's own `name`, itself holding
+//     `platform_schema`/`business_schema` (optionally `response_schema`),
+//     marks a DECLARATION capability -- neither an attachment nor a
+//     lookup/search operation, but a standalone platform/business config
+//     declaration (identity_linking's `config.scopes`; permalink's
+//     `config.endpoint`) -- the exact shape identity_linking.json and
+//     permalink.json use. See classifyCapability/isDeclarationCapability.
+// A capability matching NONE of these is left alone and reported via
+// `skipped` below, loudly, rather than silently dropped.
 function isCoreRegistryFile(sourceRel) {
   return [
     "ucp.json",
@@ -1471,6 +1488,31 @@ function isTypeFile(sourceRel) {
   return /(^|\/)types\//.test(sourceRel);
 }
 
+// A fourth capability shape, alongside lookup, search, and checkout-order-
+// cart extension: a capability that is neither attached to a host resource
+// nor a read-only operation, but instead redeclares itself under its OWN `name` as
+// a $defs key holding role-scoped discovery variants -- `platform_schema`
+// (and usually `business_schema`, optionally `response_schema`) -- the exact
+// three roles capability.json's own generic base defines, redeclared
+// per-capability so the capability can layer its own required/config fields
+// on top (identity_linking's business_schema requires `config.scopes`;
+// permalink's requires `config.endpoint`). Verified present in BOTH
+// 2026-04-08 and 2026-08-25 for identity_linking, and newly in 2026-08-25
+// for permalink -- two independent capabilities using the identical shape,
+// not a one-off tailored to either file. See discoverAdditionalCapabilities'
+// "declaration" branch for how this is projected.
+function isDeclarationCapability(schema) {
+  const own = schema?.$defs?.[schema?.name];
+  return Boolean(
+    own &&
+      typeof own === "object" &&
+      own.platform_schema &&
+      typeof own.platform_schema === "object" &&
+      own.business_schema &&
+      typeof own.business_schema === "object"
+  );
+}
+
 function classifyCapability(schema) {
   const defs = schema?.$defs ?? {};
   if (defs.lookup_request && defs.lookup_response) {
@@ -1482,7 +1524,131 @@ function classifyCapability(schema) {
   if (hasAttachmentDef(schema)) {
     return "extension";
   }
+  if (isDeclarationCapability(schema)) {
+    return "declaration";
+  }
   return "none";
+}
+
+// capability.json's own base -> ucp.json#/$defs/entity chain is what every
+// declaration capability's platform_schema/business_schema ultimately allOf-
+// refs. Both known declaration capabilities (identity_linking, permalink)
+// live exactly one schemas/-root-relative directory below the root
+// (common/, shopping/) -- the same depth every capability file lives at, and
+// the only depth capability.json's OWN doc comment ("Extensions are
+// capabilities with an 'extends' field") describes -- so they spell the
+// cross-file $ref as "../capability.json"/"../ucp.json". Registering both
+// the bare and one-level-relative spellings against the SAME loaded docs
+// resolves any current or future capability at that depth without hand-
+// listing which files use it; flattenAllOf (below) already tolerates
+// deeper chains (capability.json's own base -> ucp.json#/$defs/entity) via
+// the same rootDocs map.
+function buildDeclarationRootDocs() {
+  const capabilitySchema = loadRootSchema("capability.json");
+  const ucpSchema = loadRootSchema("ucp.json");
+  return {
+    "capability.json": capabilitySchema,
+    "../capability.json": capabilitySchema,
+    "ucp.json": ucpSchema,
+    "../ucp.json": ucpSchema,
+  };
+}
+
+// Flatten one role variant (platform_schema/business_schema/response_schema)
+// into a self-contained compat schema: flattenAllOf resolves and merges the
+// generic capability.json/ucp.json boilerplate (version, schema, spec, id,
+// extends, config) directly into the capability's own required/properties,
+// so the emitted schema needs no further cross-file $ref into capability.json
+// or ucp.json at all. Unlike buildEntityResponseSchema (which leaf-ifies with
+// toCompatLeaf), properties are kept AS-IS: the whole reason to model these
+// is to keep each capability's own nested $defs (identity_linking's
+// scope_policy/scope_token/provider; permalink's endpoint/config) intact
+// rather than collapsing "config" to an untyped object, which the generic
+// discovery/capability.json compat schema already provides.
+// capability.json#/$defs/base's own "extends" property $refs
+// "common/types/reverse_domain_name.json" -- a FILE reference relative to
+// capability.json's own location (schemas root), not to wherever the
+// flattened boilerplate ends up living. "extends" is the ONLY property
+// capability.json's base/platform_schema/business_schema/response_schema
+// (or ucp.json's entity, the other doc this boilerplate ever merges in)
+// declares with a file-valued $ref anywhere in it -- verified directly
+// against both docs above; every other generic field (version, spec,
+// schema, id, config) is either a plain scalar or (version) a bare
+// same-document ref, already handled separately below. Scoped to this one,
+// verified property rather than a blanket deep rewrite: a capability's OWN
+// delta properties (identity_linking's "config", permalink's "config") can
+// carry their OWN, already-correct file refs (e.g. "types/description.json"
+// relative to THEIR file), and a blanket walk would wrongly rewrite those
+// as if they too came from capability.json.
+function rewriteExtendsFileRefs(node, outputRel, schemaCache) {
+  if (Array.isArray(node)) {
+    return node.map((entry) => rewriteExtendsFileRefs(entry, outputRel, schemaCache));
+  }
+  if (!node || typeof node !== "object") {
+    return node;
+  }
+  if (typeof node.$ref === "string" && !node.$ref.startsWith("#")) {
+    return {
+      ...node,
+      $ref: rewriteRef(node.$ref, "capability.json", outputRel, "response", schemaCache),
+    };
+  }
+  const result = {};
+  for (const [key, value] of Object.entries(node)) {
+    result[key] = rewriteExtendsFileRefs(value, outputRel, schemaCache);
+  }
+  return result;
+}
+
+function buildDeclarationVariantSchema(variantSchema, currentDoc, rootDocs, outputRel, schemaCache) {
+  const acc = flattenAllOf(variantSchema, currentDoc, rootDocs, {
+    required: new Set(),
+    properties: {},
+  });
+  if (acc.properties.extends) {
+    acc.properties.extends = rewriteExtendsFileRefs(acc.properties.extends, outputRel, schemaCache);
+  }
+
+  // flattenAllOf merges each allOf part's OWN `properties` object as-is (it
+  // only resolves $ref at the NODE level, to walk INTO an allOf/$ref chain --
+  // never at the property-VALUE level). ucp.json#/$defs/entity.properties.
+  // version is itself a bare same-document fragment ("$ref": "#/$defs/
+  // version", meaning "ucp.json's own $defs.version"): merged verbatim, that
+  // ref would dangle once written into a DIFFERENT file's $defs (this
+  // capability's own), which has no "version" key of its own. The existing
+  // toCompatLeaf path (buildEntityResponseSchema and friends) never hits this
+  // because it collapses every $ref-only property to a plain string before
+  // it can dangle; declaration variants keep richer structure (so a
+  // capability's own typed "config" is not flattened to a blob) but must
+  // apply that SAME collapse, and only that collapse, to a property that is
+  // ONLY a same-document $ref -- inject-schema-constraints.mjs reattaches the
+  // pattern this drops in a later pass, exactly as it already does for every
+  // other quicktype-dropped constraint.
+  const properties = {};
+  for (const [name, propertySchema] of Object.entries(acc.properties)) {
+    if (
+      propertySchema &&
+      typeof propertySchema === "object" &&
+      typeof propertySchema.$ref === "string" &&
+      propertySchema.$ref.startsWith("#/")
+    ) {
+      properties[name] = {
+        type: "string",
+        ...(propertySchema.description ? { description: propertySchema.description } : {}),
+      };
+      continue;
+    }
+    properties[name] = propertySchema;
+  }
+
+  return {
+    $schema: "https://json-schema.org/draft/2020-12/schema",
+    ...(variantSchema.title ? { title: variantSchema.title } : {}),
+    ...(variantSchema.description ? { description: variantSchema.description } : {}),
+    type: "object",
+    required: [...acc.required].sort(),
+    properties,
+  };
 }
 
 // Discover capability schemas not already covered by topLevelVariantMap or
@@ -1505,6 +1671,7 @@ function discoverAdditionalCapabilities(schemaCache, excludedSourceRels) {
   const variantMap = {};
   const manifest = [];
   const skipped = [];
+  let declarationRootDocs;
 
   for (const [sourceRel, schema] of schemaCache.entries()) {
     if (
@@ -1587,10 +1754,70 @@ function discoverAdditionalCapabilities(schemaCache, excludedSourceRels) {
       continue;
     }
 
+    if (kind === "declaration") {
+      declarationRootDocs ??= buildDeclarationRootDocs();
+      const own = schema.$defs[schema.name];
+      const projected = clone(schema);
+      delete projected.$defs[schema.name];
+
+      for (const variant of ["platform_schema", "business_schema", "response_schema"]) {
+        if (!own[variant]) {
+          continue;
+        }
+        projected.$defs[variant] = buildDeclarationVariantSchema(
+          own[variant],
+          schema,
+          declarationRootDocs,
+          sourceRel,
+          schemaCache
+        );
+        manifest.push(`${sourceRel}#/$defs/${variant}`);
+      }
+
+      writeJson(path.join(outputSchemasRoot, sourceRel), projected);
+      continue;
+    }
+
     skipped.push({ sourceRel, name: schema.name });
   }
 
   return { variantMap, manifest, skipped };
+}
+
+// Type files under common/types/ are ALWAYS projected as standalone schema
+// files (writeProjectedCommonTypeSchemas, above) so any capability that
+// $refs one resolves correctly. But a type file with no INBOUND $ref from
+// anything already reachable -- e.g. 2026-08-25's four payment-credential
+// subtypes (card/pan/network_token/token_credential.json), which only $ref
+// back to their shared base (payment_credential.json) via allOf, never the
+// other way -- has no --src PATH INTO quicktype at all: nothing reachable
+// from the pinned resources or a discovered capability ever names it, so it
+// is projected to disk and then never generated. Rather than hand-listing
+// which files are currently orphaned (a list that silently goes stale the
+// next time a spec release adds or removes one), EVERY common/types file is
+// added to the manifest, to be generated the same way a discovered
+// capability already is: in its own isolated quicktype invocation (see
+// generate_models.sh), merged in via merge-generated-fragment.mjs. A file
+// already reachable transitively (e.g. payment_credential.json itself)
+// regenerates a byte-identical duplicate of its existing declaration, which
+// merge-generated-fragment.mjs already skips as "already present" -- so
+// this is safe to apply to the whole directory, not just the orphaned ones.
+// A file quicktype cannot represent AT ALL (2026-08-25's
+// constraint_expression.json: verified genuinely self-referential, see
+// containsRootSelfRef) fails its own isolated invocation and must be
+// reviewed onto check-generation-completeness.mjs's
+// KNOWN_UNREPRESENTABLE_FAMILIES instead of silently vanishing -- the same
+// gate a discovered capability's own unrepresentable shape already goes
+// through.
+function discoverCommonTypeFiles(schemaCache) {
+  const manifest = [];
+  for (const sourceRel of schemaCache.keys()) {
+    if (!sourceRel.startsWith("common/types/")) {
+      continue;
+    }
+    manifest.push(`common/types/${path.posix.basename(sourceRel)}`);
+  }
+  return manifest.sort();
 }
 
 // Transport envelopes (source/schemas/transports/*.json) are a separate
@@ -1650,6 +1877,7 @@ for (const sourceRel of Object.keys(topLevelVariantMap)) {
 const { variantMap: discoveredVariantMap, manifest: discoveredManifest, skipped } =
   discoverAdditionalCapabilities(schemaCache, knownSourceRels);
 const transportManifest = discoverTransportEnvelopes(schemaCache);
+const typeManifest = discoverCommonTypeFiles(schemaCache);
 
 writeCompatibilityDiscoverySchemas();
 writeCompatibilityCoreSchemas();
@@ -1670,6 +1898,7 @@ writeCompatibilityAp2Schema(schemaCache);
 writeJson(path.join(outputRoot, "generated-src-manifest.json"), {
   capabilities: discoveredManifest,
   transports: transportManifest,
+  types: typeManifest,
 });
 
 if (skipped.length > 0) {

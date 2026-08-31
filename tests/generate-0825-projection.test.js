@@ -143,16 +143,22 @@ test("discovers a new common/ extension capability attaching to BOTH checkout an
   );
 });
 
-test("does not model a pre-existing capability that matches no known shape (identity_linking is out of scope here)", () => {
-  // Not present in this fixture at all -- this documents the boundary: only
-  // lookup/search/extension-shaped capabilities are auto-discovered, so a
-  // capability like identity_linking (own config shape, no attachment def,
-  // no lookup/search pair) is correctly left as a residual rather than
-  // silently swept in. See discoverAdditionalCapabilities's module comment.
+test("models a capability matching none of lookup/search/extension via the fourth, DECLARATION shape", () => {
+  // This test originally documented the OPPOSITE boundary (identity_linking
+  // as a deliberate residual, "out of scope here") -- true when this file
+  // was written, no longer true since project-credential-identity-defs
+  // added a fourth capability shape (classifyCapability's "declaration":
+  // a $defs key equal to the capability's own `name`, itself holding
+  // platform_schema/business_schema). tests/fixtures/reorg-spec now carries
+  // a common/identity_linking.json fixture reproducing that exact shape;
+  // full projection + quicktype-generation coverage for it lives in
+  // tests/project-credential-identity-defs.test.js -- this test only pins
+  // the boundary claim itself: identity_linking is no longer a residual.
   const outDir = runProjector();
   const manifest = readJson(outDir, "generated-src-manifest.json");
   assert.ok(
-    !manifest.capabilities.some((entry) => entry.includes("identity_linking"))
+    manifest.capabilities.some((entry) => entry.includes("identity_linking")),
+    "identity_linking must now be on the manifest, not left as a residual"
   );
 });
 

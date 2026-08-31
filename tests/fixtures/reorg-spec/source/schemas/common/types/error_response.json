@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ucp.dev/schemas/common/types/error_response.json",
+  "title": "Error Response",
+  "description": "Fixture mirroring the real 2026-08-25 common/types/error_response.json: a generic type file whose own $ref reaches ucp.json#/$defs/error, only actually exercised once common/types files are generated at all.",
+  "type": "object",
+  "required": ["ucp"],
+  "properties": {
+    "ucp": {
+      "$ref": "../../ucp.json#/$defs/error",
+      "description": "UCP protocol metadata for an error response."
+    },
+    "error_response_marker": { "type": "string" }
+  }
+}

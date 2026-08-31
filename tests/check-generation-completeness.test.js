@@ -48,13 +48,15 @@ const {
   KNOWN_UNREPRESENTABLE_FAMILIES,
 } = require("../scripts/check-generation-completeness.mjs");
 
-test("KNOWN_UNREPRESENTABLE_FAMILIES contains exactly the one reviewed exclusion", () => {
+test("KNOWN_UNREPRESENTABLE_FAMILIES contains exactly the three reviewed exclusions", () => {
   // Not a rule against ever growing this list -- but any addition should be
   // a deliberate, reviewed PR change, not something that silently creeps.
   // If this test starts failing because a new entry was added, update it as
   // part of reviewing that addition.
   assert.deepEqual(KNOWN_UNREPRESENTABLE_FAMILIES, [
     "common/payment_authentication",
+    "common/types/constraint_expression",
+    "common/types/request_constraints",
   ]);
 });
 

@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ucp.dev/schemas/common/identity_linking.json",
+  "name": "dev.ucp.common.identity_linking",
+  "title": "Identity Linking",
+  "description": "Fixture mirroring the real 2026-08-25/2026-04-08 identity_linking.json shape: a capability that is neither a checkout/order/cart attachment nor a lookup/search pair, but redeclares itself under its own name with platform_schema/business_schema role variants.",
+
+  "$defs": {
+    "scope_policy": {
+      "type": "object",
+      "title": "Scope Policy",
+      "properties": {
+        "marker": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+
+    "dev.ucp.common.identity_linking": {
+      "platform_schema": {
+        "title": "Identity Linking (Platform)",
+        "allOf": [{ "$ref": "../capability.json#/$defs/platform_schema" }]
+      },
+      "business_schema": {
+        "title": "Identity Linking (Business)",
+        "allOf": [
+          { "$ref": "../capability.json#/$defs/business_schema" },
+          {
+            "type": "object",
+            "required": ["config"],
+            "properties": {
+              "config": {
+                "type": "object",
+                "required": ["scopes"],
+                "properties": {
+                  "scopes": {
+                    "type": "object",
+                    "description": "identity_linking_scope_marker",
+                    "additionalProperties": { "$ref": "#/$defs/scope_policy" }
+                  }
+                },
+                "additionalProperties": true
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}

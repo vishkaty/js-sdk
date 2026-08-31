@@ -50,6 +50,38 @@ export const KNOWN_UNREPRESENTABLE_FAMILIES = [
   // catch-all on the same object" AT ALL -- "Internal error: ." with zero
   // further detail, independent of the allOf-merge machinery in this repo.
   "common/payment_authentication",
+  // common/types/constraint_expression -- 2026-08-25's Object Constraint
+  // schema, genuinely self-referential ("$ref": "#" pointing at its own
+  // whole document). quicktype's typescript-zod target cannot place a type
+  // like this AT ALL -- verified in total isolation (this one schema, zero
+  // other content): it exhausts its internal type-ordering pass and
+  // silently emits nothing, with only a WARNING ("Exceeded maximum number
+  // of passes when determining output order, output may contain forward
+  // references") and NO non-zero exit. In its actual per-family invocation
+  // (bundled with --src discovery/*.json, as every family is, so quicktype
+  // can resolve $refs into it) this failure mode is even quieter: the
+  // shared discovery content still generates successfully alongside it, so
+  // the fragment is non-empty and the process still exits 0 -- the family
+  // contributes zero export declarations beyond that shared baseline,
+  // which is what generate_models.sh's per-family loop now checks for
+  // directly (see its own comment) rather than relying on exit code or a
+  // non-empty fragment alone. This is the exact failure mode issue #64
+  // documents.
+  "common/types/constraint_expression",
+  // common/types/request_constraints -- the SAME underlying limitation as
+  // constraint_expression above, reached a different way: its own
+  // "properties.additionalProperties" and "anyOf.items" both $ref
+  // constraint_expression.json directly (a oneOf branch and an items
+  // schema, not a property that is ONLY a $ref, so
+  // dropSelfReferentialProperties -- scoped deliberately narrowly, see its
+  // own comment in scripts/project-current-ucp-schemas.mjs -- does not
+  // catch it the way it catches available_payment_instrument.json's
+  // "constraints" property). Verified directly: its own per-family
+  // invocation logs the identical "Exceeded maximum number of passes"
+  // warning and contributes zero export declarations beyond the shared
+  // discovery baseline, the same signature as constraint_expression
+  // itself, not a new or different failure.
+  "common/types/request_constraints",
 ];
 
 export function checkCompleteness(failedFamilies) {

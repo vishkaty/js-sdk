@@ -64,9 +64,11 @@ PROJECTED_CONSTRAINT_SCHEMA_DIR=""
 TMP_OUTPUT="$(mktemp "${TMPDIR:-/tmp}/ucp-spec-generated.XXXXXX")"
 PROJECTED_SPEC_DIR=""
 FRAGMENT_FILES=()
+BASELINE_OUTPUT=""
 cleanup() {
   rm -f "$TMP_OUTPUT"
   rm -f "${FRAGMENT_FILES[@]+"${FRAGMENT_FILES[@]}"}"
+  rm -f "$BASELINE_OUTPUT"
   if [[ -n "$PROJECTED_SPEC_DIR" ]]; then
     rm -rf "$PROJECTED_SPEC_DIR"
   fi
@@ -224,6 +226,45 @@ FAILED_FAMILIES=()
 FRAGMENT_FILES=()
 MANIFEST_FILE="$SPEC_DIR/generated-src-manifest.json"
 if [[ -f "$MANIFEST_FILE" ]]; then
+  # Every per-family invocation below bundles --src discovery/*.json
+  # alongside the family's own --src, so quicktype can resolve $refs into
+  # it -- which means quicktype exiting 0 with a non-empty fragment is NOT
+  # enough to prove the family itself generated anything: a family whose
+  # own type quicktype cannot represent (confirmed: 2026-08-25's
+  # common/types/constraint_expression.json, genuinely self-referential,
+  # its type-ordering pass "Exceeded maximum number of passes when
+  # determining output order") still exits 0 and still emits the
+  # discovery-only content successfully, alongside literally nothing of
+  # its own -- silently indistinguishable from success by exit code alone
+  # (this is issue #64's documented failure mode).
+  #
+  # A plain discovery-only baseline, computed once here rather than per
+  # family, is compared against each family's own fragment below (see
+  # scripts/count-new-exports.mjs) -- but "zero new exports beyond the
+  # baseline" is NOT, by itself, a safe failure signal: verified directly
+  # against the real 2026-08-25 tree, several genuinely SUCCESSFUL
+  # families also produce it. A common/types file whose root schema is a
+  # bare scalar (e.g. reverse_domain_name.json, a pattern-constrained
+  # string with no object properties) has nothing for quicktype's
+  # schema-mode to name at the top level, so it legitimately contributes
+  # zero new exports. A common/types file already reachable TRANSITIVELY
+  # from discovery/*.json alone (e.g. available_payment_instrument.json,
+  # reached via payment_handler_resp.json) produces the identical
+  # declaration in both the baseline and its own fragment, also netting
+  # zero new names on a complete success (a different comparison, and a
+  # different point in the pipeline, from merge-generated-fragment.mjs
+  # skipping true duplicates against MAIN, later). Neither of those cases
+  # logs the type-ordering warning quicktype emits specifically when it
+  # silently drops content (containsRootSelfRef's own comment in
+  # scripts/project-current-ucp-schemas.mjs documents this exact string).
+  # So the actual failure signal used below is the CONJUNCTION -- zero new
+  # exports AND that warning present in the family's own log -- not
+  # either alone.
+  BASELINE_OUTPUT="$(mktemp "${TMPDIR:-/tmp}/ucp-fragment-baseline.XXXXXX")"
+  npx quicktype --lang typescript-zod --src-lang schema \
+      --src "$SPEC_DIR"/discovery/*.json \
+      -o "$BASELINE_OUTPUT"
+
   while IFS= read -r family; do
     [[ -n "$family" ]] || continue
     FAMILY_ARGS=()
@@ -233,7 +274,7 @@ if [[ -f "$MANIFEST_FILE" ]]; then
     done < <(node -e '
       const manifest = require(process.argv[1]);
       const family = process.argv[2];
-      for (const entry of [...manifest.capabilities, ...manifest.transports]) {
+      for (const entry of [...manifest.capabilities, ...manifest.transports, ...(manifest.types ?? [])]) {
         if (familyKeyOf(entry) === family) {
           process.stdout.write(entry + "\n");
         }
@@ -255,7 +296,45 @@ if [[ -f "$MANIFEST_FILE" ]]; then
         --src "$SPEC_DIR"/discovery/*.json \
         "${FAMILY_ARGS[@]}" \
         -o "$FRAGMENT_OUTPUT" >"$FRAGMENT_LOG" 2>&1; then
-      FRAGMENT_FILES+=("$FRAGMENT_OUTPUT")
+      # See the BASELINE_OUTPUT comment above: a non-zero exit is not the
+      # only quicktype failure mode this loop must catch. The actual
+      # comparison lives in scripts/count-new-exports.mjs (directly unit-
+      # tested there), not inline here, the same way the allowlist decision
+      # lives in scripts/check-generation-completeness.mjs rather than in
+      # this script.
+      #
+      # "Zero new exports beyond the baseline" ALONE is not a safe failure
+      # signal on its own -- verified directly, not assumed: several
+      # genuinely successful families produce it too. A common/types file
+      # whose root schema is a bare scalar (e.g. reverse_domain_name.json,
+      # a pattern-constrained string with no object properties) has nothing
+      # for quicktype's schema-mode to name at the top level, so it
+      # contributes zero NEW exports while succeeding completely -- there
+      # is nothing missing. A common/types file already reachable
+      # TRANSITIVELY from discovery/*.json alone (e.g.
+      # available_payment_instrument.json, reached via
+      # payment_handler_resp.json) produces the identical declaration in
+      # both the baseline and its own family fragment, so it also nets zero
+      # NEW names while being a complete success, not a duplicate-and-
+      # skipped case (that dedup is merge-generated-fragment.mjs's job,
+      # against MAIN, later -- a different comparison at a different
+      # point). Neither of those logs the type-ordering warning quicktype
+      # emits specifically when it silently drops content
+      # (containsRootSelfRef's own comment documents this exact string).
+      # So the failure this loop must catch is the CONJUNCTION: zero new
+      # exports AND that specific warning present in this family's own
+      # log -- the two together are what "exited 0 while silently
+      # contributing nothing it was asked for" actually looks like;
+      # neither alone is a safe signal.
+      NEW_EXPORT_COUNT="$(node scripts/count-new-exports.mjs "$BASELINE_OUTPUT" "$FRAGMENT_OUTPUT")"
+      if [[ "$NEW_EXPORT_COUNT" -eq 0 ]] && grep -q "Exceeded maximum number of passes" "$FRAGMENT_LOG"; then
+        echo "generate_models.sh: \"$family\" exited 0 but contributed zero export declarations beyond the shared discovery baseline, and quicktype's own log shows why (a silent failure, not a crash):" >&2
+        tail -n 5 "$FRAGMENT_LOG" >&2
+        FAILED_FAMILIES+=("$family")
+        rm -f "$FRAGMENT_OUTPUT"
+      else
+        FRAGMENT_FILES+=("$FRAGMENT_OUTPUT")
+      fi
     else
       echo "generate_models.sh: \"$family\" failed its quicktype invocation:" >&2
       tail -n 5 "$FRAGMENT_LOG" >&2
@@ -266,7 +345,7 @@ if [[ -f "$MANIFEST_FILE" ]]; then
   done < <(node -e '
     const manifest = require(process.argv[1]);
     const families = new Set();
-    for (const entry of [...manifest.capabilities, ...manifest.transports]) {
+    for (const entry of [...manifest.capabilities, ...manifest.transports, ...(manifest.types ?? [])]) {
       const [file] = entry.split("#");
       const family = file.replace(/\.(create_req|update_req)\.json$/, "").replace(/_resp\.json$/, "").replace(/\.json$/, "");
       families.add(family);

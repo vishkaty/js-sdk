@@ -1,0 +1,8 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ucp.dev/schemas/common/types/reverse_domain_name.json",
+  "title": "Reverse Domain Name",
+  "description": "Fixture mirroring the real common/types/reverse_domain_name.json, needed once capability.json#/$defs/base's own \"extends\" property (a reverse-domain-name array/string union) is actually resolved end to end -- previously never exercised by a fixture test invoking the full discovery/*.json set together.",
+  "type": "string",
+  "pattern": "^[a-z](?:[a-z0-9-]*[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9_-]*[a-z0-9_])?)+$"
+}

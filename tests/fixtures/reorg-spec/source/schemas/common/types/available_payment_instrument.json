@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ucp.dev/schemas/common/types/available_payment_instrument.json",
+  "title": "Available Payment Instrument",
+  "description": "Fixture mirroring the real common/types/available_payment_instrument.json, needed once payment_handler.json#/$defs/base's own \"available_instruments\" property is actually resolved end to end -- previously never exercised by a fixture test invoking the full discovery/*.json set together.",
+  "type": "object",
+  "required": ["type"],
+  "properties": {
+    "type": { "type": "string" }
+  }
+}
